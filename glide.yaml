@@ -1,0 +1,14 @@
+package: network-go-manage-loadbalancer
+import:
+- package: github.com/Azure/azure-sdk-for-go
+  version: v7.0.1-beta
+  subpackages:
+  - arm/compute
+  - arm/network
+  - arm/resources/resources
+  - arm/storage
+- package: github.com/Azure/go-autorest
+  version: v7.2.2
+  subpackages:
+  - autorest/azure
+  - autorest/to
