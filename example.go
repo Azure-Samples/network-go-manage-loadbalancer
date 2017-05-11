@@ -8,6 +8,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/Azure/azure-sdk-for-go/arm/resources/resources"
 	"github.com/Azure/azure-sdk-for-go/arm/storage"
+	"github.com/Azure/go-autorest/autorest"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 )
@@ -39,19 +41,20 @@ var (
 
 var (
 	subscriptionID string
-	spToken        *azure.ServicePrincipalToken
+	authorizer     *autorest.BearerAuthorizer
 )
 
 func init() {
 	subscriptionID = getEnvVarOrExit("AZURE_SUBSCRIPTION_ID")
 	tenantID := getEnvVarOrExit("AZURE_TENANT_ID")
 
-	oauthConfig, err := azure.PublicCloud.OAuthConfigForTenant(tenantID)
+	oauthConfig, err := adal.NewOAuthConfig(azure.PublicCloud.ActiveDirectoryEndpoint, tenantID)
 	onErrorFail(err, "OAuthConfigForTenant failed")
 
 	clientID := getEnvVarOrExit("AZURE_CLIENT_ID")
 	clientSecret := getEnvVarOrExit("AZURE_CLIENT_SECRET")
-	spToken, err = azure.NewServicePrincipalToken(*oauthConfig, clientID, clientSecret, azure.PublicCloud.ResourceManagerEndpoint)
+	spToken, err := adal.NewServicePrincipalToken(*oauthConfig, clientID, clientSecret, azure.PublicCloud.ResourceManagerEndpoint)
+	authorizer = autorest.NewBearerAuthorizer(spToken)
 	onErrorFail(err, "NewServicePrincipalToken failed")
 
 	createClients()
@@ -59,13 +62,12 @@ func init() {
 
 func main() {
 	fmt.Println("Creating resource group")
-	resourceGroupParameters := resources.ResourceGroup{
+	resourceGroupParameters := resources.Group{
 		Location: &westus}
 	_, err := groupClient.CreateOrUpdate(groupName, resourceGroupParameters)
 	onErrorFail(err, "CreateOrUpdate failed")
 
-	fmt.Println("Creating storage account")
-	// apcp := storage.AccountPropertiesCreateParameters{}
+	fmt.Println("Starting to create storage account...")
 	accountParameters := storage.AccountCreateParameters{
 		Sku: &storage.Sku{
 			Name: storage.StandardLRS,
@@ -73,12 +75,10 @@ func main() {
 		Kind:     storage.Storage,
 		Location: &westus,
 		AccountPropertiesCreateParameters: &storage.AccountPropertiesCreateParameters{},
-		// AccountPropertiesCreateParameters: &apcp,
 	}
-	_, err = accountClient.Create(groupName, storageAccountName, accountParameters, nil)
-	onErrorFail(err, "Create failed")
+	_, errStorageAccount := accountClient.Create(groupName, storageAccountName, accountParameters, nil)
 
-	fmt.Println("Creating public IP address")
+	fmt.Println("Starting to create public IP address...")
 	pip := network.PublicIPAddress{
 		Location: &westus,
 		PublicIPAddressPropertiesFormat: &network.PublicIPAddressPropertiesFormat{
@@ -88,14 +88,12 @@ func main() {
 			},
 		},
 	}
-	_, err = pipClient.CreateOrUpdate(groupName, ipName, pip, nil)
-	onErrorFail(err, "CreateOrUpdate failed")
+	pipChan, errPIP := pipClient.CreateOrUpdate(groupName, ipName, pip, nil)
+	onErrorFail(<-errPIP, "CreateOrUpdate Public IP failed")
+	fmt.Println("... public IP created")
+	pip = <-pipChan
 
-	fmt.Println("Getting public IP address info")
-	pip, err = pipClient.Get(groupName, ipName, "")
-	onErrorFail(err, "Get failed")
-
-	fmt.Println("Creating load balancer")
+	fmt.Println("Starting to create load balancer...")
 	lb := network.LoadBalancer{
 		Location: &westus,
 		LoadBalancerPropertiesFormat: &network.LoadBalancerPropertiesFormat{
@@ -152,14 +150,12 @@ func main() {
 			},
 		},
 	}
-	_, err = lbClient.CreateOrUpdate(groupName, loadBalancerName, lb, nil)
-	onErrorFail(err, "CreateOrUpdate failed")
+	lbChan, errLB := lbClient.CreateOrUpdate(groupName, loadBalancerName, lb, nil)
+	onErrorFail(<-errLB, "CreateOrUpdate Load Balancer failed")
+	fmt.Println("... load balancer created")
+	lb = <-lbChan
 
-	fmt.Println("Getting load balancer info")
-	lb, err = lbClient.Get(groupName, loadBalancerName, "")
-	onErrorFail(err, "CreateOrUpdate failed")
-
-	fmt.Println("Creating virtual network")
+	fmt.Println("Starting to create virtual network...")
 	vNetParameters := network.VirtualNetwork{
 		Location: &westus,
 		VirtualNetworkPropertiesFormat: &network.VirtualNetworkPropertiesFormat{
@@ -168,27 +164,29 @@ func main() {
 			},
 		},
 	}
-	_, err = vNetClient.CreateOrUpdate(groupName, vNetName, vNetParameters, nil)
-	onErrorFail(err, "CreateOrUpdate failed")
+	_, errVnet := vNetClient.CreateOrUpdate(groupName, vNetName, vNetParameters, nil)
+	onErrorFail(<-errVnet, "CreateOrUpdate Virtual Network failed")
+	fmt.Println("... virtual network created")
 
-	fmt.Println("Creating subnet")
+	fmt.Println("Starting to create subnet...")
 	subnet := network.Subnet{
 		SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
 			AddressPrefix: to.StringPtr("10.0.0.0/24"),
 		},
 	}
-	_, err = subnetClient.CreateOrUpdate(groupName, vNetName, subnetName, subnet, nil)
-	onErrorFail(err, "CreateOrUpdate failed")
-
-	fmt.Println("Getting subnet info")
-	subnet, err = subnetClient.Get(groupName, vNetName, subnetName, "")
-	onErrorFail(err, "Get failed")
+	subnetChan, errSubnet := subnetClient.CreateOrUpdate(groupName, vNetName, subnetName, subnet, nil)
+	onErrorFail(<-errSubnet, "CreateOrUpdate Subnet failed")
+	fmt.Println("... subnet created")
+	subnet = <-subnetChan
 
 	fmt.Println("Creating availability set")
 	availSet := compute.AvailabilitySet{
 		Location: &westus}
 	availSet, err = availSetClient.CreateOrUpdate(groupName, "availSet", availSet)
 	onErrorFail(err, "CreateOrUpdate failed")
+
+	onErrorFail(<-errStorageAccount, "Create Storage Account failed")
+	fmt.Println("... storage account created")
 
 	fmt.Printf("Creating virtual machine '%s'\n", vmName1)
 	err = createVM(vmName1, subnet.ID, availSet.ID, pip.IPAddress, lb, 0)
@@ -214,9 +212,10 @@ func main() {
 	var input string
 	fmt.Scanln(&input)
 
-	fmt.Println("Deleting the resource group")
-	_, err = groupClient.Delete(groupName, nil)
-	onErrorFail(err, "Delete failed")
+	fmt.Println("Starting to delete the resource group...")
+	_, errGroup := groupClient.Delete(groupName, nil)
+	onErrorFail(<-errGroup, "Delete resource group failed")
+	fmt.Println("... resource group deleted")
 
 	fmt.Println("Done!")
 }
@@ -224,31 +223,31 @@ func main() {
 // createClients initializes and adds token to all needed clients in the sample.
 func createClients() {
 	groupClient = resources.NewGroupsClient(subscriptionID)
-	groupClient.Authorizer = spToken
+	groupClient.Authorizer = authorizer
 
 	lbClient = network.NewLoadBalancersClient(subscriptionID)
-	lbClient.Authorizer = spToken
+	lbClient.Authorizer = authorizer
 
 	vNetClient = network.NewVirtualNetworksClient(subscriptionID)
-	vNetClient.Authorizer = spToken
+	vNetClient.Authorizer = authorizer
 
 	subnetClient = network.NewSubnetsClient(subscriptionID)
-	subnetClient.Authorizer = spToken
+	subnetClient.Authorizer = authorizer
 
 	pipClient = network.NewPublicIPAddressesClient(subscriptionID)
-	pipClient.Authorizer = spToken
+	pipClient.Authorizer = authorizer
 
 	interfaceClient = network.NewInterfacesClient(subscriptionID)
-	interfaceClient.Authorizer = spToken
+	interfaceClient.Authorizer = authorizer
 
 	availSetClient = compute.NewAvailabilitySetsClient(subscriptionID)
-	availSetClient.Authorizer = spToken
+	availSetClient.Authorizer = authorizer
 
 	accountClient = storage.NewAccountsClient(subscriptionID)
-	accountClient.Authorizer = spToken
+	accountClient.Authorizer = authorizer
 
 	vmClient = compute.NewVirtualMachinesClient(subscriptionID)
-	vmClient.Authorizer = spToken
+	vmClient.Authorizer = authorizer
 }
 
 // buildNATrule returns a network.InboundNatRule struct with all needed fields included.
@@ -311,25 +310,26 @@ func buildNICparams(subnetID *string, lb network.LoadBalancer, natRule int) netw
 func createVM(vmName string, subnetID, availSetID, ipAddress *string, lb network.LoadBalancer, natRule int) error {
 	nicName := fmt.Sprintf("nic-%s", vmName)
 
-	fmt.Printf("Creating NIC for '%s' machine\n", vmName)
+	fmt.Printf("Starting to create NIC for '%s' machine\n", vmName)
 	nic := buildNICparams(subnetID, lb, natRule)
-	_, err := interfaceClient.CreateOrUpdate(groupName, nicName, nic, nil)
+	nicChan, errNIC := interfaceClient.CreateOrUpdate(groupName, nicName, nic, nil)
+	err := <-errNIC
 	if err != nil {
+		fmt.Println("Create NIC failed")
 		return err
 	}
+	fmt.Println("NIC created")
+	nic = <-nicChan
 
-	fmt.Printf("Getting NIC info for '%s' machine\n", vmName)
-	nic, err = interfaceClient.Get(groupName, nicName, "")
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Creating machine '%s'\n", vmName)
+	fmt.Printf("Starting to create machine '%s'\n", vmName)
 	vm := buildVMparams(vmName, nic.ID, availSetID)
-	_, err = vmClient.CreateOrUpdate(groupName, vmName, vm, nil)
+	_, errVM := vmClient.CreateOrUpdate(groupName, vmName, vm, nil)
+	err = <-errVM
 	if err != nil {
+		fmt.Println("Create VM failed")
 		return err
 	}
+	fmt.Println("VM created")
 
 	fmt.Printf("Now you can connect to '%s' via 'ssh %s@%s -p %v' with password '%s'\n",
 		vmName,
